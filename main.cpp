@@ -21,6 +21,50 @@
 #include "azure_cloud_credentials.h"
 
 /**
+ * Provisioning client includes
+ */
+#include "azure_prov_client/prov_transport_mqtt_client.h"
+#include "azure_prov_client/prov_device_client.h"
+#include "azure_prov_client/prov_security_factory.h"
+
+#define PROVISIONING_DEMO 0
+#define SAMPLE_MQTT
+
+MU_DEFINE_ENUM_STRINGS_WITHOUT_INVALID(PROV_DEVICE_RESULT, PROV_DEVICE_RESULT_VALUE);
+MU_DEFINE_ENUM_STRINGS_WITHOUT_INVALID(PROV_DEVICE_REG_STATUS, PROV_DEVICE_REG_STATUS_VALUES);
+
+static const char* global_prov_uri = "global.azure-devices-provisioning.net";
+static const char* id_scope = "0ne000FFA42";
+
+volatile static bool g_registration_complete = false;
+static bool g_use_proxy = false;
+static const char* PROXY_ADDRESS = "127.0.0.1";
+
+#define PROXY_PORT                  8888
+#define MESSAGES_TO_SEND            2
+#define TIME_BETWEEN_MESSAGES       2
+
+static void registration_status_callback(PROV_DEVICE_REG_STATUS reg_status, void* user_context)
+{
+    (void)user_context;
+    (void)printf("Provisioning Status: %s\r\n", MU_ENUM_TO_STRING(PROV_DEVICE_REG_STATUS, reg_status));
+}
+
+static void register_device_callback(PROV_DEVICE_RESULT register_result, const char* iothub_uri, const char* device_id, void* user_context)
+{
+    (void)user_context;
+    if (register_result == PROV_DEVICE_RESULT_OK)
+    {
+        (void)printf("\r\nRegistration Information received from service: %s, deviceId: %s\r\n", iothub_uri, device_id);
+    }
+    else
+    {
+        (void)printf("\r\nFailure registering device: %s\r\n", MU_ENUM_TO_STRING(PROV_DEVICE_RESULT, register_result));
+    }
+    g_registration_complete = true;
+}
+
+/**
  * This example sends and receives messages to and from Azure IoT Hub.
  * The API usages are based on Azure SDK's official iothub_convenience_sample.
  */
@@ -160,6 +204,96 @@ cleanup:
     IoTHub_Deinit();
 }
 
+int provisioning_demo(void) {
+    SECURE_DEVICE_TYPE hsm_type;
+    //hsm_type = SECURE_DEVICE_TYPE_TPM;
+    //hsm_type = SECURE_DEVICE_TYPE_X509;
+    hsm_type = SECURE_DEVICE_TYPE_SYMMETRIC_KEY;
+
+    // Used to initialize IoTHub SDK subsystem
+    (void)IoTHub_Init();
+    (void)prov_dev_security_init(hsm_type);
+
+    // Set the symmetric key if using they auth type
+    prov_dev_set_symmetric_key_info("69ccd566-cdf2-4608-8bee-561054d744f1",
+            "VV/wq59ZDfHpf4CmOiP+dTVlhASxF3/aoKR2b4S21HA=");
+
+    HTTP_PROXY_OPTIONS http_proxy;
+    PROV_DEVICE_TRANSPORT_PROVIDER_FUNCTION prov_transport;
+
+    memset(&http_proxy, 0, sizeof(HTTP_PROXY_OPTIONS));
+
+    // Protocol to USE - HTTP, AMQP, AMQP_WS, MQTT, MQTT_WS
+#ifdef SAMPLE_MQTT
+    prov_transport = Prov_Device_MQTT_Protocol;
+#endif // SAMPLE_MQTT
+#ifdef SAMPLE_MQTT_OVER_WEBSOCKETS
+    prov_transport = Prov_Device_MQTT_WS_Protocol;
+#endif // SAMPLE_MQTT_OVER_WEBSOCKETS
+#ifdef SAMPLE_AMQP
+    prov_transport = Prov_Device_AMQP_Protocol;
+#endif // SAMPLE_AMQP
+#ifdef SAMPLE_AMQP_OVER_WEBSOCKETS
+    prov_transport = Prov_Device_AMQP_WS_Protocol;
+#endif // SAMPLE_AMQP_OVER_WEBSOCKETS
+#ifdef SAMPLE_HTTP
+    prov_transport = Prov_Device_HTTP_Protocol;
+#endif // SAMPLE_HTTP
+
+    printf("Provisioning API Version: %s\r\n", Prov_Device_GetVersionString());
+
+    if (g_use_proxy)
+    {
+        http_proxy.host_address = PROXY_ADDRESS;
+        http_proxy.port = PROXY_PORT;
+    }
+
+    PROV_DEVICE_RESULT prov_device_result = PROV_DEVICE_RESULT_ERROR;
+    PROV_DEVICE_HANDLE prov_device_handle;
+    if ((prov_device_handle = Prov_Device_Create(global_prov_uri, id_scope, prov_transport)) == NULL)
+    {
+        (void)printf("failed calling Prov_Device_Create\r\n");
+    }
+    else
+    {
+        if (http_proxy.host_address != NULL)
+        {
+            Prov_Device_SetOption(prov_device_handle, OPTION_HTTP_PROXY, &http_proxy);
+        }
+
+        //bool traceOn = true;
+        //Prov_Device_SetOption(prov_device_handle, PROV_OPTION_LOG_TRACE, &traceOn);
+#ifdef SET_TRUSTED_CERT_IN_SAMPLES
+        // Setting the Trusted Certificate. This is only necessary on systems without
+        // built in certificate stores.
+        Prov_Device_SetOption(prov_device_handle, OPTION_TRUSTED_CERT, certificates);
+#endif // SET_TRUSTED_CERT_IN_SAMPLES
+
+        // This option sets the registration ID it overrides the registration ID that is
+        // set within the HSM so be cautious if setting this value
+        //Prov_Device_SetOption(prov_device_handle, PROV_REGISTRATION_ID, "[REGISTRATION ID]");
+
+        prov_device_result = Prov_Device_Register_Device(prov_device_handle, register_device_callback, NULL, registration_status_callback, NULL);
+
+        (void)printf("\r\nRegistering Device\r\n\r\n");
+        do
+        {
+            ThreadAPI_Sleep(1000);
+        } while (!g_registration_complete);
+
+        Prov_Device_Destroy(prov_device_handle);
+    }
+    prov_dev_security_deinit();
+
+    // Free all the sdk subsystem
+    IoTHub_Deinit();
+
+    (void)printf("Press enter key to exit:\r\n");
+    (void)getchar();
+
+    return 0;
+}
+
 int main() {
     LogInfo("Connecting to the network");
 
@@ -188,9 +322,15 @@ int main() {
     LogInfo("Time: %s", ctime(&timestamp));
     set_time(timestamp);
 
+#if PROVISIONING_DEMO
+    LogInfo("Starting provisioning demo");
+    provisioning_demo();
+    LogInfo("Provisioning has ended");
+#else
     LogInfo("Starting the Demo");
     demo();
     LogInfo("The demo has ended");
+#endif
 
     return 0;
 }
