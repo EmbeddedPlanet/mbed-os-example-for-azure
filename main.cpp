@@ -10,6 +10,7 @@
 #include "certs.h"
 #include "iothub.h"
 #include "iothub_client_options.h"
+#include "iothub_client_version.h"
 #include "iothub_device_client.h"
 #include "iothub_message.h"
 #include "azure_c_shared_utility/shared_util_options.h"
@@ -18,16 +19,54 @@
 #include "azure_c_shared_utility/xlogging.h"
 
 #include "iothubtransportmqtt.h"
-#include "azure_cloud_credentials.h"
 
 /**
  * Provisioning client includes
  */
-#include "azure_prov_client/prov_transport_mqtt_client.h"
-#include "azure_prov_client/prov_device_client.h"
+#include "iothub_device_client_ll.h"
+#include "iothub_client_options.h"
+#include "azure_prov_client/prov_device_ll_client.h"
 #include "azure_prov_client/prov_security_factory.h"
+#include "azure_c_shared_utility/http_proxy_io.h"
 
-#define PROVISIONING_DEMO 0
+//
+// The protocol you wish to use should be uncommented
+//
+#define SAMPLE_MQTT
+//#define SAMPLE_MQTT_OVER_WEBSOCKETS
+//#define SAMPLE_AMQP
+//#define SAMPLE_AMQP_OVER_WEBSOCKETS
+//#define SAMPLE_HTTP
+
+#ifdef SAMPLE_MQTT
+#include "iothubtransportmqtt.h"
+#include "azure_prov_client/prov_transport_mqtt_client.h"
+#endif // SAMPLE_MQTT
+#ifdef SAMPLE_MQTT_OVER_WEBSOCKETS
+#include "iothubtransportmqtt_websockets.h"
+#include "azure_prov_client/prov_transport_mqtt_ws_client.h"
+#endif // SAMPLE_MQTT_OVER_WEBSOCKETS
+#ifdef SAMPLE_AMQP
+#include "iothubtransportamqp.h"
+#include "azure_prov_client/prov_transport_amqp_client.h"
+#endif // SAMPLE_AMQP
+#ifdef SAMPLE_AMQP_OVER_WEBSOCKETS
+#include "iothubtransportamqp_websockets.h"
+#include "azure_prov_client/prov_transport_amqp_ws_client.h"
+#endif // SAMPLE_AMQP_OVER_WEBSOCKETS
+#ifdef SAMPLE_HTTP
+#include "iothubtransporthttp.h"
+#include "azure_prov_client/prov_transport_http_client.h"
+#endif // SAMPLE_HTTP
+
+#ifdef SET_TRUSTED_CERT_IN_SAMPLES
+#include "certs.h"
+#endif // SET_TRUSTED_CERT_IN_SAMPLES
+
+// This sample is to demostrate iothub reconnection with provisioning and should not
+// be confused as production code
+
+#define PROVISIONING_DEMO 1
 #define SAMPLE_MQTT
 
 MU_DEFINE_ENUM_STRINGS_WITHOUT_INVALID(PROV_DEVICE_RESULT, PROV_DEVICE_RESULT_VALUE);
@@ -36,7 +75,6 @@ MU_DEFINE_ENUM_STRINGS_WITHOUT_INVALID(PROV_DEVICE_REG_STATUS, PROV_DEVICE_REG_S
 static const char* global_prov_uri = "global.azure-devices-provisioning.net";
 static const char* id_scope = "0ne000FFA42";
 
-volatile static bool g_registration_complete = false;
 static bool g_use_proxy = false;
 static const char* PROXY_ADDRESS = "127.0.0.1";
 
@@ -44,165 +82,85 @@ static const char* PROXY_ADDRESS = "127.0.0.1";
 #define MESSAGES_TO_SEND            2
 #define TIME_BETWEEN_MESSAGES       2
 
+typedef struct CLIENT_SAMPLE_INFO_TAG
+{
+    unsigned int sleep_time;
+    char* iothub_uri;
+    char* access_key_name;
+    char* device_key;
+    char* device_id;
+    int registration_complete;
+} CLIENT_SAMPLE_INFO;
+
+typedef struct IOTHUB_CLIENT_SAMPLE_INFO_TAG
+{
+    int connected;
+    int stop_running;
+} IOTHUB_CLIENT_SAMPLE_INFO;
+
+static IOTHUBMESSAGE_DISPOSITION_RESULT receive_msg_callback(IOTHUB_MESSAGE_HANDLE message, void* user_context)
+{
+    (void)message;
+    IOTHUB_CLIENT_SAMPLE_INFO* iothub_info = (IOTHUB_CLIENT_SAMPLE_INFO*)user_context;
+    (void)printf("Stop message recieved from IoTHub\r\n");
+    iothub_info->stop_running = 1;
+    return IOTHUBMESSAGE_ACCEPTED;
+}
+
 static void registration_status_callback(PROV_DEVICE_REG_STATUS reg_status, void* user_context)
 {
     (void)user_context;
     (void)printf("Provisioning Status: %s\r\n", MU_ENUM_TO_STRING(PROV_DEVICE_REG_STATUS, reg_status));
 }
 
-static void register_device_callback(PROV_DEVICE_RESULT register_result, const char* iothub_uri, const char* device_id, void* user_context)
+static void iothub_connection_status(IOTHUB_CLIENT_CONNECTION_STATUS result, IOTHUB_CLIENT_CONNECTION_STATUS_REASON reason, void* user_context)
 {
-    (void)user_context;
-    if (register_result == PROV_DEVICE_RESULT_OK)
+    (void)reason;
+    if (user_context == NULL)
     {
-        (void)printf("\r\nRegistration Information received from service: %s, deviceId: %s\r\n", iothub_uri, device_id);
+        printf("iothub_connection_status user_context is NULL\r\n");
     }
     else
     {
-        (void)printf("\r\nFailure registering device: %s\r\n", MU_ENUM_TO_STRING(PROV_DEVICE_RESULT, register_result));
+        IOTHUB_CLIENT_SAMPLE_INFO* iothub_info = (IOTHUB_CLIENT_SAMPLE_INFO*)user_context;
+        if (result == IOTHUB_CLIENT_CONNECTION_AUTHENTICATED)
+        {
+            iothub_info->connected = 1;
+        }
+        else
+        {
+            iothub_info->connected = 0;
+            iothub_info->stop_running = 1;
+        }
     }
-    g_registration_complete = true;
 }
 
-/**
- * This example sends and receives messages to and from Azure IoT Hub.
- * The API usages are based on Azure SDK's official iothub_convenience_sample.
- */
+static void register_device_callback(PROV_DEVICE_RESULT register_result, const char* iothub_uri, const char* device_id, void* user_context)
+{
+    if (user_context == NULL)
+    {
+        printf("user_context is NULL\r\n");
+    }
+    else
+    {
+        CLIENT_SAMPLE_INFO* user_ctx = (CLIENT_SAMPLE_INFO*)user_context;
+        if (register_result == PROV_DEVICE_RESULT_OK)
+        {
+            (void)printf("Registration Information received from service: %s!\r\n", iothub_uri);
+            (void)mallocAndStrcpy_s(&user_ctx->iothub_uri, iothub_uri);
+            (void)mallocAndStrcpy_s(&user_ctx->device_id, device_id);
+            user_ctx->registration_complete = 1;
+        }
+        else
+        {
+            (void)printf("Failure encountered on registration %s\r\n", MU_ENUM_TO_STRING(PROV_DEVICE_RESULT, register_result) );
+            user_ctx->registration_complete = 2;
+        }
+    }
+}
 
 // Global symbol referenced by the Azure SDK's port for Mbed OS, via "extern"
 NetworkInterface *_defaultSystemNetwork;
-
-static bool message_received = false;
-
-static void on_connection_status(IOTHUB_CLIENT_CONNECTION_STATUS result, IOTHUB_CLIENT_CONNECTION_STATUS_REASON reason, void* user_context)
-{
-    if (result == IOTHUB_CLIENT_CONNECTION_AUTHENTICATED) {
-        LogInfo("Connected to IoT Hub");
-    } else {
-        LogError("Connection failed, reason: %s", MU_ENUM_TO_STRING(IOTHUB_CLIENT_CONNECTION_STATUS_REASON, reason));
-    }
-}
-
-static IOTHUBMESSAGE_DISPOSITION_RESULT on_message_received(IOTHUB_MESSAGE_HANDLE message, void* user_context)
-{
-    LogInfo("Message received from IoT Hub");
-
-    const unsigned char *data_ptr;
-    size_t len;
-    if (IoTHubMessage_GetByteArray(message, &data_ptr, &len) != IOTHUB_MESSAGE_OK) {
-        LogError("Failed to extract message data, please try again on IoT Hub");
-        return IOTHUBMESSAGE_ABANDONED;
-    }
-
-    message_received = true;
-    LogInfo("Message body: %.*s", len, data_ptr);
-    return IOTHUBMESSAGE_ACCEPTED;
-}
-
-static void on_message_sent(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void* userContextCallback)
-{
-    if (result == IOTHUB_CLIENT_CONFIRMATION_OK) {
-        LogInfo("Message sent successfully");
-    } else {
-        LogInfo("Failed to send message, error: %s",
-            MU_ENUM_TO_STRING(IOTHUB_CLIENT_CONFIRMATION_RESULT, result));
-    }
-}
-
-void demo() {
-    bool trace_on = MBED_CONF_APP_IOTHUB_CLIENT_TRACE;
-    tickcounter_ms_t interval = 100;
-    IOTHUB_CLIENT_RESULT res;
-
-    LogInfo("Initializing IoT Hub client");
-    IoTHub_Init();
-
-    IOTHUB_DEVICE_CLIENT_HANDLE client_handle = IoTHubDeviceClient_CreateFromConnectionString(
-        azure_cloud::credentials::iothub_connection_string,
-        MQTT_Protocol
-    );
-    if (client_handle == nullptr) {
-        LogError("Failed to create IoT Hub client handle");
-        goto cleanup;
-    }
-
-    // Enable SDK tracing
-    res = IoTHubDeviceClient_SetOption(client_handle, OPTION_LOG_TRACE, &trace_on);
-    if (res != IOTHUB_CLIENT_OK) {
-        LogError("Failed to enable IoT Hub client tracing, error: %d", res);
-        goto cleanup;
-    }
-
-    // Enable static CA Certificates defined in the SDK
-    res = IoTHubDeviceClient_SetOption(client_handle, OPTION_TRUSTED_CERT, certificates);
-    if (res != IOTHUB_CLIENT_OK) {
-        LogError("Failed to set trusted certificates, error: %d", res);
-        goto cleanup;
-    }
-
-    // Process communication every 100ms
-    res = IoTHubDeviceClient_SetOption(client_handle, OPTION_DO_WORK_FREQUENCY_IN_MS, &interval);
-    if (res != IOTHUB_CLIENT_OK) {
-        LogError("Failed to set communication process frequency, error: %d", res);
-        goto cleanup;
-    }
-
-    // set incoming message callback
-    res = IoTHubDeviceClient_SetMessageCallback(client_handle, on_message_received, nullptr);
-    if (res != IOTHUB_CLIENT_OK) {
-        LogError("Failed to set message callback, error: %d", res);
-        goto cleanup;
-    }
-
-    // Set connection/disconnection callback
-    res = IoTHubDeviceClient_SetConnectionStatusCallback(client_handle, on_connection_status, nullptr);
-    if (res != IOTHUB_CLIENT_OK) {
-        LogError("Failed to set connection status callback, error: %d", res);
-        goto cleanup;
-    }
-
-    // Send ten message to the cloud (one per second)
-    // or until we receive a message from the cloud
-    IOTHUB_MESSAGE_HANDLE message_handle;
-    char message[80];
-    for (int i = 0; i < 10; ++i) {
-        if (message_received) {
-            // If we have received a message from the cloud, don't send more messeges
-            break;
-        }
-
-        sprintf(message, "%d messages left to send, or until we receive a reply", 10 - i);
-        LogInfo("Sending: \"%s\"", message);
-
-        message_handle = IoTHubMessage_CreateFromString(message);
-        if (message_handle == nullptr) {
-            LogError("Failed to create message");
-            goto cleanup;
-        }
-
-        res = IoTHubDeviceClient_SendEventAsync(client_handle, message_handle, on_message_sent, nullptr);
-        IoTHubMessage_Destroy(message_handle); // message already copied into the SDK
-
-        if (res != IOTHUB_CLIENT_OK) {
-            LogError("Failed to send message event, error: %d", res);
-            goto cleanup;
-        }
-
-        ThisThread::sleep_for(1s);
-    }
-
-    // If the user didn't manage to send a cloud-to-device message earlier,
-    // let's wait until we receive one
-    while (!message_received) {
-        // Continue to receive messages in the communication thread
-        // which is internally created and maintained by the Azure SDK.
-        sleep();
-    }
-
-cleanup:
-    IoTHubDeviceClient_Destroy(client_handle);
-    IoTHub_Deinit();
-}
 
 int provisioning_demo(void) {
     SECURE_DEVICE_TYPE hsm_type;
@@ -210,18 +168,20 @@ int provisioning_demo(void) {
     //hsm_type = SECURE_DEVICE_TYPE_X509;
     hsm_type = SECURE_DEVICE_TYPE_SYMMETRIC_KEY;
 
-    // Used to initialize IoTHub SDK subsystem
+    bool traceOn = false;
+
     (void)IoTHub_Init();
     (void)prov_dev_security_init(hsm_type);
-
     // Set the symmetric key if using they auth type
     prov_dev_set_symmetric_key_info("69ccd566-cdf2-4608-8bee-561054d744f1",
             "VV/wq59ZDfHpf4CmOiP+dTVlhASxF3/aoKR2b4S21HA=");
 
-    HTTP_PROXY_OPTIONS http_proxy;
     PROV_DEVICE_TRANSPORT_PROVIDER_FUNCTION prov_transport;
+    HTTP_PROXY_OPTIONS http_proxy;
+    CLIENT_SAMPLE_INFO user_ctx;
 
     memset(&http_proxy, 0, sizeof(HTTP_PROXY_OPTIONS));
+    memset(&user_ctx, 0, sizeof(CLIENT_SAMPLE_INFO));
 
     // Protocol to USE - HTTP, AMQP, AMQP_WS, MQTT, MQTT_WS
 #ifdef SAMPLE_MQTT
@@ -240,7 +200,12 @@ int provisioning_demo(void) {
     prov_transport = Prov_Device_HTTP_Protocol;
 #endif // SAMPLE_HTTP
 
-    printf("Provisioning API Version: %s\r\n", Prov_Device_GetVersionString());
+    // Set ini
+    user_ctx.registration_complete = 0;
+    user_ctx.sleep_time = 10;
+
+    printf("Provisioning API Version: %s\r\n", Prov_Device_LL_GetVersionString());
+    printf("Iothub API Version: %s\r\n", IoTHubClient_GetVersionString());
 
     if (g_use_proxy)
     {
@@ -248,41 +213,148 @@ int provisioning_demo(void) {
         http_proxy.port = PROXY_PORT;
     }
 
-    PROV_DEVICE_RESULT prov_device_result = PROV_DEVICE_RESULT_ERROR;
-    PROV_DEVICE_HANDLE prov_device_handle;
-    if ((prov_device_handle = Prov_Device_Create(global_prov_uri, id_scope, prov_transport)) == NULL)
+    PROV_DEVICE_LL_HANDLE handle;
+    if ((handle = Prov_Device_LL_Create(global_prov_uri, id_scope, prov_transport)) == NULL)
     {
-        (void)printf("failed calling Prov_Device_Create\r\n");
+        (void)printf("failed calling Prov_Device_LL_Create\r\n");
     }
     else
     {
         if (http_proxy.host_address != NULL)
         {
-            Prov_Device_SetOption(prov_device_handle, OPTION_HTTP_PROXY, &http_proxy);
+            Prov_Device_LL_SetOption(handle, OPTION_HTTP_PROXY, &http_proxy);
         }
 
-        //bool traceOn = true;
-        //Prov_Device_SetOption(prov_device_handle, PROV_OPTION_LOG_TRACE, &traceOn);
+        Prov_Device_LL_SetOption(handle, PROV_OPTION_LOG_TRACE, &traceOn);
 #ifdef SET_TRUSTED_CERT_IN_SAMPLES
         // Setting the Trusted Certificate. This is only necessary on systems without
         // built in certificate stores.
-        Prov_Device_SetOption(prov_device_handle, OPTION_TRUSTED_CERT, certificates);
+        Prov_Device_LL_SetOption(handle, OPTION_TRUSTED_CERT, certificates);
 #endif // SET_TRUSTED_CERT_IN_SAMPLES
 
         // This option sets the registration ID it overrides the registration ID that is
         // set within the HSM so be cautious if setting this value
-        //Prov_Device_SetOption(prov_device_handle, PROV_REGISTRATION_ID, "[REGISTRATION ID]");
+        //Prov_Device_LL_SetOption(handle, PROV_REGISTRATION_ID, "[REGISTRATION ID]");
 
-        prov_device_result = Prov_Device_Register_Device(prov_device_handle, register_device_callback, NULL, registration_status_callback, NULL);
-
-        (void)printf("\r\nRegistering Device\r\n\r\n");
-        do
+        if (Prov_Device_LL_Register_Device(handle, register_device_callback, &user_ctx, registration_status_callback, &user_ctx) != PROV_DEVICE_RESULT_OK)
         {
-            ThreadAPI_Sleep(1000);
-        } while (!g_registration_complete);
-
-        Prov_Device_Destroy(prov_device_handle);
+            (void)printf("failed calling Prov_Device_LL_Register_Device\r\n");
+        }
+        else
+        {
+            do
+            {
+                Prov_Device_LL_DoWork(handle);
+                ThreadAPI_Sleep(user_ctx.sleep_time);
+            } while (user_ctx.registration_complete == 0);
+        }
+        Prov_Device_LL_Destroy(handle);
     }
+
+    if (user_ctx.registration_complete != 1)
+    {
+        (void)printf("registration failed!\r\n");
+    }
+    else
+    {
+        IOTHUB_CLIENT_TRANSPORT_PROVIDER iothub_transport;
+
+        // Protocol to USE - HTTP, AMQP, AMQP_WS, MQTT, MQTT_WS
+#if defined(SAMPLE_MQTT) || defined(SAMPLE_HTTP) // HTTP sample will use mqtt protocol
+        iothub_transport = MQTT_Protocol;
+#endif // SAMPLE_MQTT
+#ifdef SAMPLE_MQTT_OVER_WEBSOCKETS
+        iothub_transport = MQTT_WebSocket_Protocol;
+#endif // SAMPLE_MQTT_OVER_WEBSOCKETS
+#ifdef SAMPLE_AMQP
+        iothub_transport = AMQP_Protocol;
+#endif // SAMPLE_AMQP
+#ifdef SAMPLE_AMQP_OVER_WEBSOCKETS
+        iothub_transport = AMQP_Protocol_over_WebSocketsTls;
+#endif // SAMPLE_AMQP_OVER_WEBSOCKETS
+
+        IOTHUB_DEVICE_CLIENT_LL_HANDLE device_ll_handle;
+
+        (void)printf("Creating IoTHub Device handle\r\n");
+        if ((device_ll_handle = IoTHubDeviceClient_LL_CreateFromDeviceAuth(user_ctx.iothub_uri, user_ctx.device_id, iothub_transport) ) == NULL)
+        {
+            (void)printf("failed create IoTHub client from connection string %s!\r\n", user_ctx.iothub_uri);
+        }
+        else
+        {
+            IOTHUB_CLIENT_SAMPLE_INFO iothub_info;
+            TICK_COUNTER_HANDLE tick_counter_handle = tickcounter_create();
+            tickcounter_ms_t current_tick;
+            tickcounter_ms_t last_send_time = 0;
+            size_t msg_count = 0;
+            iothub_info.stop_running = 0;
+            iothub_info.connected = 0;
+
+            (void)IoTHubDeviceClient_LL_SetConnectionStatusCallback(device_ll_handle, iothub_connection_status, &iothub_info);
+
+            // Set any option that are neccessary.
+            // For available options please see the iothub_sdk_options.md documentation
+
+            IoTHubDeviceClient_LL_SetOption(device_ll_handle, OPTION_LOG_TRACE, &traceOn);
+
+#ifdef SET_TRUSTED_CERT_IN_SAMPLES
+            // Setting the Trusted Certificate. This is only necessary on systems without
+            // built in certificate stores.
+            IoTHubDeviceClient_LL_SetOption(device_ll_handle, OPTION_TRUSTED_CERT, certificates);
+#endif // SET_TRUSTED_CERT_IN_SAMPLES
+
+            (void)IoTHubDeviceClient_LL_SetMessageCallback(device_ll_handle, receive_msg_callback, &iothub_info);
+
+            (void)printf("Sending 1 messages to IoTHub every %d seconds for %d messages (Send any message to stop)\r\n", TIME_BETWEEN_MESSAGES, MESSAGES_TO_SEND);
+            do
+            {
+                if (iothub_info.connected != 0)
+                {
+                    // Send a message every TIME_BETWEEN_MESSAGES seconds
+                    (void)tickcounter_get_current_ms(tick_counter_handle, &current_tick);
+                    if ((current_tick - last_send_time) / 1000 > TIME_BETWEEN_MESSAGES)
+                    {
+                        static char msgText[1024];
+                        sprintf_s(msgText, sizeof(msgText), "{ \"message_index\" : \"%zu\" }", msg_count++);
+
+                        IOTHUB_MESSAGE_HANDLE msg_handle = IoTHubMessage_CreateFromByteArray((const unsigned char*)msgText, strlen(msgText));
+                        if (msg_handle == NULL)
+                        {
+                            (void)printf("ERROR: iotHubMessageHandle is NULL!\r\n");
+                        }
+                        else
+                        {
+                            if (IoTHubDeviceClient_LL_SendEventAsync(device_ll_handle, msg_handle, NULL, NULL) != IOTHUB_CLIENT_OK)
+                            {
+                                (void)printf("ERROR: IoTHubClient_LL_SendEventAsync..........FAILED!\r\n");
+                            }
+                            else
+                            {
+                                (void)tickcounter_get_current_ms(tick_counter_handle, &last_send_time);
+                                (void)printf("IoTHubClient_LL_SendEventAsync accepted message [%zu] for transmission to IoT Hub.\r\n", msg_count);
+
+                            }
+                            IoTHubMessage_Destroy(msg_handle);
+                        }
+                    }
+                }
+                IoTHubDeviceClient_LL_DoWork(device_ll_handle);
+                ThreadAPI_Sleep(1);
+            } while (iothub_info.stop_running == 0 && msg_count < MESSAGES_TO_SEND);
+
+            size_t index = 0;
+            for (index = 0; index < 10; index++)
+            {
+                IoTHubDeviceClient_LL_DoWork(device_ll_handle);
+                ThreadAPI_Sleep(1);
+            }
+            tickcounter_destroy(tick_counter_handle);
+            // Clean up the iothub sdk handle
+            IoTHubDeviceClient_LL_Destroy(device_ll_handle);
+        }
+    }
+    free(user_ctx.iothub_uri);
+    free(user_ctx.device_id);
     prov_dev_security_deinit();
 
     // Free all the sdk subsystem
@@ -331,6 +403,10 @@ int main() {
     demo();
     LogInfo("The demo has ended");
 #endif
+
+    while (true) {
+        sleep();
+    }
 
     return 0;
 }

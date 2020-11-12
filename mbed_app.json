@@ -1,14 +1,21 @@
 {
+    "macros": [
+        "HSM_TYPE_SYMM_KEY",
+        "SET_TRUSTED_CERT_IN_SAMPLES",
+        "USE_PROV_MODULE"
+    ],
     "config": {
         "iothub_client_trace": {
             "help": "Enable IoT Hub Client tracing",
-            "value": false
+            "value": true
         }
     },
     "target_overrides": {
         "*": {
             "platform.stdio-convert-newlines": true,
-            "platform.stdio-baud-rate": 115200
+            "platform.stdio-baud-rate": 115200,
+            "mbed-trace.enable": true,
+            "mbed-trace.max-level": "TRACE_LEVEL_DEBUG"
         },
         "DISCO_L475VG_IOT01A": {
             "target.components_add": ["wifi_ism43362"],
@@ -18,7 +25,7 @@
             "nsapi.default-wifi-password": "\"PASSWORD\""
         },
         "EP_AGORA": {
-            "nsapi.default-cellular-apn"                : "\"APN\"",
+            "nsapi.default-cellular-apn"                : "\"j108.com.attz\"",
             "nsapi.default-cellular-sim-pin"            : null,
             "nsapi.default-cellular-username"           : null,
             "nsapi.default-cellular-password"           : null,
@@ -35,7 +42,7 @@
             "lwip.tcpip-thread-stacksize"               : 2000,
             "nsapi.dns-response-wait-time"              : 30000,
             "lwip.use-mbed-trace"                       : true,
-            "lwip.debug-enabled"                        : false,
+            "lwip.debug-enabled"                        : true,
             "target.features_remove": ["CRYPTOCELL310"],
             "target.macros_remove": ["MBEDTLS_CONFIG_HW_SUPPORT"],
             "target.macros_add": ["NRFX_RNG_ENABLED=1", "RNG_ENABLED=1", "NRF_QUEUE_ENABLED=1"]
